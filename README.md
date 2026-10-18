@@ -8,20 +8,65 @@ pyglet's GPU-batched OpenGL rendering**, using native ARM64 dependencies on macO
 
 ## Run
 
-From this project directory, using your existing environment:
+Install **Python 3.13** with `venv` and `pip` available. The interactive window
+needs a desktop session and an OpenGL-capable graphics driver (OpenGL 3.3 is
+requested). The tested platform is macOS on Apple silicon with Python 3.13.1;
+the Linux and Windows setup commands below have not been GUI-tested here.
+
+Clone the repository and enter it:
 
 ```sh
+git clone https://github.com/mcChicken811/2DElectroMagnetismSimulator.git
+cd 2DElectroMagnetismSimulator
+```
+
+If you already cloned it, open a terminal in your clone's root directory—the
+folder containing `main.py` and `requirements-lock.txt`. The `.venv` directory
+is not included in Git; create your own environment and install the pinned
+dependencies using the commands for your platform.
+
+**macOS / Linux (Terminal):**
+
+```sh
+python3.13 -m venv .venv
+mkdir -p .cache/tmp .cache/pip
+TMPDIR="$PWD/.cache/tmp" PIP_CACHE_DIR="$PWD/.cache/pip" .venv/bin/python -m pip install -r requirements-lock.txt
 .venv/bin/python main.py
 ```
 
-Dependencies are already installed in `.venv`. To reproduce the tested versions:
+If Python 3.13 is installed as `python3`, use `python3 -m venv .venv` instead.
 
-```sh
-mkdir -p .cache/tmp .cache/pip
-TMPDIR="$PWD/.cache/tmp" PIP_CACHE_DIR="$PWD/.cache/pip" .venv/bin/python -m pip install -r requirements-lock.txt
+**Windows (PowerShell):**
+
+```powershell
+py -3.13 -m venv .venv
+New-Item -ItemType Directory -Force .cache/tmp, .cache/pip | Out-Null
+$env:TEMP = Join-Path $PWD ".cache/tmp"
+$env:TMP = $env:TEMP
+$env:PIP_CACHE_DIR = Join-Path $PWD ".cache/pip"
+.\.venv\Scripts\python.exe -m pip install -r requirements-lock.txt
+.\.venv\Scripts\python.exe main.py
 ```
 
-Python 3.13 is tested. The first launch compiles numerical kernels; subsequent
+If the `py` launcher is unavailable, use `python -m venv .venv` with Python 3.13
+on your PATH. These commands use the virtual environment's interpreter directly;
+activation is not required. Dependency installation needs an internet connection
+and keeps pip's cache and temporary files inside the clone.
+
+For later launches, run only the final command for your platform from the
+repository root. Re-run the dependency installation command after pulling changes
+that update `requirements-lock.txt`.
+
+To check the numerical solver without opening a window:
+
+```sh
+.venv/bin/python main.py --benchmark --charges 100 --steps 3000
+```
+
+On Windows, replace `.venv/bin/python` in this and the examples below with
+`.\.venv\Scripts\python.exe`.
+
+The first launch compiles numerical kernels; subsequent
 launches use `.cache/numba`. No global Python packages are needed. Source,
 dependencies, application caches, temporary files, and generated screenshots
 belong to this project. The Cocoa setup installs **volatile, in-memory defaults**

@@ -37,6 +37,7 @@ def benchmark(sim, steps):
         'machine': platform.machine(), 'python': platform.python_version(),
         'grid': [sim.config.nx, sim.config.ny], 'charges': len(sim.charge),
         'field_padding': sim.config.field_padding,
+        'source_filter_passes': sim.config.source_filter_passes,
         'field_grid': list(sim._bz.shape),
         'steps': steps, 'physics_ms_per_step': physics_s*1000/steps,
         'physics_realtime_capacity': steps*sim.dt/physics_s,
@@ -66,6 +67,15 @@ def smoke_test(window):
             window.on_mouse_press(x, y, mouse.LEFT, 0)
             window.on_mouse_release(x, y, mouse.LEFT, 0)
 
+    def click_button(name):
+        x, y, w, h, _, _ = window.buttons[name]
+        window.on_mouse_press(x+w/2, y+h/2, mouse.LEFT, 0)
+        window.on_mouse_release(x+w/2, y+h/2, mouse.LEFT, 0)
+
+    def edit(name, value):
+        click_button('inspect_edit_'+name)
+        window.on_text(value)
+
     def screenshot(name):
         window.switch_to()
         window.on_draw()
@@ -75,6 +85,33 @@ def smoke_test(window):
         try:
             sim = window.sim
             window.action('pause')
+            # Continuous log2 time scale, including endpoints and default 1x.
+            sx, sy, sw = window.time_slider
+            assert abs((window.speed_knob.x-sx)/sw-5/6) < 1e-12
+            initial_dt, initial_steps = sim.dt, sim.steps
+            window.on_mouse_press(sx, sy, mouse.LEFT, 0)
+            assert window.speed == 2**-5 and window.slider_dragging
+            window.on_mouse_drag(sx+sw/2, sy, sw/2, 0, mouse.LEFT, 0)
+            assert window.speed == .25
+            window.on_mouse_drag(sx+sw+40, sy, sw, 0, mouse.LEFT, 0)
+            assert window.speed == 2.
+            window.on_mouse_release(sx+sw+40, sy, mouse.LEFT, 0)
+            assert not window.slider_dragging and sim.dragged == -1
+            assert sim.dt == initial_dt and sim.steps == initial_steps and window.paused
+            window.on_mouse_press(sx-5, sy, mouse.LEFT, 0)
+            window.on_mouse_release(sx-5, sy, mouse.LEFT, 0)
+            assert window.speed == 2**-5
+            # Small accumulated steps must still advance at 1/32 speed.
+            window.action('pause')
+            for _ in range(8):
+                window.update(.1)
+            assert sim.steps-initial_steps == int(.8/32/sim.dt)
+            window.action('pause')
+            sx, sy, sw = window.time_slider
+            window.on_mouse_press(sx+sw*5/6, sy, mouse.LEFT, 0)
+            window.on_mouse_release(sx+sw*5/6, sy, mouse.LEFT, 0)
+            assert abs(window.speed-1) < 1e-12
+            screenshot('maxwell-time-slider.png')
             count = len(sim.charge)
             x, y = window.to_screen(6, 5)
             window.on_mouse_motion(x, y, 0, 0)
@@ -89,8 +126,9 @@ def smoke_test(window):
             assert len(sim.charge) == count+1, 'Space outside the window must not add a charge'
             window.on_mouse_enter(x, y)
             window.on_mouse_press(x, y, mouse.LEFT, 0)
-            assert sim.dragged == count
+            assert sim.dragged == -1 and window.inspector.selected == count
             window.on_mouse_drag(x+65, y, 65, 0, mouse.LEFT, 0)
+            assert sim.dragged == count
             for _ in range(30):
                 sim.step()
             assert sim.pos[-1, 0] > 6.1, 'Drag spring should move the charge'
@@ -135,6 +173,78 @@ def smoke_test(window):
             np.testing.assert_allclose(sim.pos[0], [sim.config.width/2, sim.config.height/2])
             assert sim.time == 0 and sim.dragged == -1
             screenshot('maxwell-reset.png')
+            # Inspector selection is force-free; text entry pauses and cannot
+            # trigger simulation shortcuts. Edits leave fields/time unchanged.
+            cx, cy = window.to_screen(*sim.pos[0])
+            window.on_mouse_press(cx, cy, mouse.LEFT, 0)
+            window.on_mouse_release(cx, cy, mouse.LEFT, 0)
+            assert window.panel_tab == 'inspector' and window.inspector.selected == 0
+            assert sim.dragged == -1
+            window.action('pause')  # Editing must pause a running simulation.
+            fields = [a.copy() for a in (sim._ex, sim._ey, sim._bz)]
+            edit('vx', '0.5')
+            assert window.paused and window.inspector.editor == 'vx'
+            click_button('pause')
+            assert window.paused  # Pending drafts cannot accidentally resume.
+            lines = window.show_lines
+            press(key.E)
+            assert window.show_lines == lines
+            press(key.ENTER)
+            np.testing.assert_allclose(sim.particle_state(0)[0], [.5*sim.config.c, 0], atol=1e-13)
+            assert sim.time == 0 and not sim.prescribed[0]
+            for actual, expected in zip((sim._ex, sim._ey, sim._bz), fields):
+                np.testing.assert_array_equal(actual, expected)
+            click_button('inspect_edit_ax')
+            assert window.inspector.editor is None  # Requires the explicit mode toggle.
+            click_button('inspect_constraint')
+            assert sim.prescribed[0]
+            edit('ax', '0.2')
+            edit('ay', '-0.1')
+            click_button('inspect_apply')
+            np.testing.assert_allclose(sim.particle_state(0)[1], [.2, -.1])
+            press(key.N)
+            assert sim.steps == 1 and window.paused
+            np.testing.assert_allclose(sim.particle_state(0)[0], [3+.2*sim.dt, -.1*sim.dt])
+            before = sim.momentum.copy()
+            edit('vx', '2')  # Reject a superluminal velocity.
+            press(key.ENTER)
+            np.testing.assert_array_equal(sim.momentum, before)
+            assert window.inspector.dirty
+            press(key.ESCAPE)
+            assert not window.inspector.dirty
+            velocity = sim.particle_state(0)[0]
+            click_button('inspect_constraint')
+            assert not sim.prescribed[0]
+            np.testing.assert_allclose(sim.particle_state(0)[0], velocity, atol=1e-13)
+            click_button('inspect_fixed')
+            assert sim.fixed[0] and sim.prescribed[0]
+            edit('vx', '0.6')  # Fixed-particle velocity remains editable.
+            press(key.ENTER)
+            assert not sim.fixed[0] and sim.prescribed[0]
+            click_button('inspect_prepare')
+            assert sim.prescribed[0] and window.paused
+            np.testing.assert_allclose(sim.particle_state(0)[1], [0, 0])
+            window.action('heat_electric')
+            screenshot('maxwell-inspector-dark.png')
+            window.action('theme')
+            screenshot('maxwell-inspector-light.png')
+            window.set_size(1000, 760)
+            window.dispatch_events()
+            screenshot('maxwell-inspector-compact.png')
+            window.set_size(1280, 860)
+            window.dispatch_events()
+            window.action('theme')
+            window.action('heat_electric')
+            # A constant coordinate acceleration cannot be held through c.
+            sim.set_motion(0, velocity=[5, 0], acceleration=[.75/sim.dt, 0])
+            press(key.N)
+            time_before = sim.time
+            window.action('pause')
+            window.update(sim.dt*1.1)
+            assert window.paused and sim.time == time_before
+            assert 'would reach c' in window.message
+            window.action('reset')
+            assert window.inspector.selected == -1
             # Delete a stationary/fixed charge while paused: the marker goes,
             # but its full field survives until the user resumes or single-steps.
             cx, cy = window.to_screen(*sim.pos[0])
@@ -143,6 +253,7 @@ def smoke_test(window):
             before_delete = [a.copy() for a in (sim._ex, sim._ey, sim._bz)]
             window.on_mouse_press(cx, cy, mouse.RIGHT, 0)
             assert len(sim.charge) == 0 and window.paused and sim.time == 0
+            assert window.inspector.selected == -1
             assert 'fields preserved' in window.message
             for actual, expected in zip((sim._ex, sim._ey, sim._bz), before_delete):
                 np.testing.assert_array_equal(actual, expected)
@@ -182,6 +293,7 @@ def smoke_test(window):
             sim.toggle_fixed(proton)
             sim.step(60)
             window.sync_particles()
+            window.action('tab_controls')
             for mode in ('electric', 'magnetic', 'energy', 'signed'):
                 window.action('heat_'+mode)
                 assert window.heat_mode == mode
@@ -199,6 +311,8 @@ def smoke_test(window):
             print('GUI smoke test passed: add, key repeat, negative charge, drag, release, '
                   'field-preserving mouse/keyboard deletion, paused/running deletion, '
                   'single-charge reset, proton/electron masses, double-click pin/release, '
+                  'inspector selection, editing, constraints, pause, speed-limit handling, boosted fields, '
+                  'log2 time slider endpoints/dragging/slow playback, '
                   'all scalar layers, theme, resize, and screenshots.', flush=True)
         except Exception as error:
             failures.append(error)
@@ -217,6 +331,8 @@ def main():
     parser.add_argument('--grid', type=grid_size, default=(128, 80), metavar='NXxNY')
     parser.add_argument('--field-padding', type=int, default=32, metavar='CELLS',
                         help='hidden field cells on each side (default: 32; minimum: 4)')
+    parser.add_argument('--source-filter', type=int, choices=range(5), default=2, metavar='0–4',
+                        help='binomial source/gather filter passes (default: 2; 0 reproduces unfiltered CIC)')
     parser.add_argument('--seed', type=int, default=7, help='repeatable initial scene')
     parser.add_argument('--theme', choices=('dark', 'light'), default='dark')
     parser.add_argument('--benchmark', action='store_true', help='measure kernels without opening a window')
@@ -233,7 +349,8 @@ def main():
         from maxwell.macos import restrict_file_writes
         restrict_file_writes()
     sim = Simulation(Config(nx=args.grid[0], ny=args.grid[1],
-                            field_padding=args.field_padding), args.charges, args.seed)
+                            field_padding=args.field_padding,
+                            source_filter_passes=args.source_filter), args.charges, args.seed)
     if args.benchmark:
         benchmark(sim, args.steps)
         return

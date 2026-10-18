@@ -84,6 +84,7 @@ Examples:
 .venv/bin/python main.py --grid 192x120 --charges 30
 .venv/bin/python main.py --grid 96x60 --charges 200
 .venv/bin/python main.py --field-padding 64
+.venv/bin/python main.py --source-filter 0
 ```
 
 `--charges` accepts any nonnegative count subject to available memory and compute.
@@ -92,13 +93,19 @@ scene. Change `--seed` to vary it. New charges can be added throughout a run.
 `--field-padding` sets the hidden field cells on **each** side of the canvas
 (default 32, minimum 4). Increasing it moves the approximate outgoing boundary
 farther away, at additional computational cost; it does not change particle walls.
+`--source-filter` accepts 0–4 binomial source/gather passes (default **2**).
+Two passes reduce the artificial wake from relativistically moving grid sources;
+zero reproduces the earlier unfiltered CIC behavior. Filtering broadens the
+charge core and is not a complete high-gamma accuracy fix. See the
+[solver investigation](docs/solver-investigation.md) for comparisons and limits.
 
 ## Controls
 
 | Input | Action |
 | --- | --- |
-| Left-drag a free charge | Apply a damped spring force toward the cursor; release to coast |
-| Double-click a charge | Fix it in space / release it from rest |
+| Single-click a charge / proton / electron | Select it and open the Inspector tab; selection applies no force |
+| Left-drag an unconstrained charge | Apply a damped spring force toward the cursor; release to coast |
+| Double-click a charge | Set v = a = 0 with Constraint Mode ON / release a fixed charge |
 | Space, with cursor over the box | Add the selected charge or particle species at that location |
 | Shift + Space | Add a negative charge |
 | `1` / `2`, or sign buttons | Select positive / negative injection |
@@ -116,22 +123,52 @@ farther away, at additional computational cost; it does not change particle wall
 | `V` | Toggle velocity arrows |
 | `D` | Cycle low / balanced / high line detail |
 | `T`, or top-right switch | Switch dark / white theme |
-| Time-scale buttons | 0.5×, 1×, or 2× simulation speed |
-| Escape | Close |
+| Time-scale slider | Continuous base-2 scale from 1/32× to 2×; 1× is five-sixths from the left |
+| Escape | Discard an active Inspector edit; otherwise close |
 
 Space is debounced: holding it does not flood the scene with particles. Dragging
 while paused records the force target; resume or step with `N` to move the charge.
+The time slider changes playback rate without changing the fixed numerical
+timestep. It can be adjusted while paused; slowing playback does not reduce
+the solver's numerical error.
 Positions at the wall are clamped to the finite charge radius. Charges may pass
 through one another: there is no extra hard-sphere collision force.
 
 Fixed charges have an outline ring and ignore Lorentz forces and dragging. They
 still contribute charge density and electric fields, but carry no current.
 Double-click again to release from rest. Pinning removes the old velocity; it
-does not save and restore it. Hovering shows the particle's species, mass, and
+does not save and restore it. Pinning now uses the same constraint system as the
+Inspector: zero velocity and zero total acceleration. Hovering shows the particle's species, mass, and
 fixed/free state. Proton and electron markers also carry a small `p` or `e`.
 Reset clears all old fields, motion, pins, and simulation time, and starts the
 single positive charge's electrostatic field. It preserves the pause and view
 settings. The six-charge startup scene and `--charges` option remain available.
+
+**Inspector:** single-click a particle to see its current velocity, coordinate
+acceleration (`dv/dt`), speed, gamma, and fixed/constraint state. Velocity inputs
+are **vx/c, vy/c**; acceleration inputs use normalized simulation units. Clicking
+an editable value pauses the simulation. Type a number and press **Enter / Apply
+edits**; **Escape / Discard** cancels. Applying preserves position, time, and E/B.
+After applying/discarding, `N` single-steps and `P` resumes. Text entry consumes
+simulation shortcuts, and pending edits block resuming. Selecting another
+particle or changing tabs discards uncommitted edits.
+
+**Constraint Mode** starts with zero total acceleration and keeps the current
+velocity. While ON, acceleration is editable and overrides Lorentz-driven motion;
+velocity remains editable even for a fixed charge. While OFF, acceleration is a
+live force-derived readout. Turning it off preserves velocity and restores the
+Higuera–Cary pusher. Disable the mode before dragging. A prescribed acceleration
+that would reach light speed pauses the run before that step; reduce the requested
+velocity/acceleration or turn the mode off. Particle reflections still operate.
+
+For a uniform-motion field test: **Reset**, select the remaining charge, set
+`vx/c = 0.6` and `vy/c = 0`, apply, then click **Steady-motion fields**. This
+explicitly replaces E/B with a mesh approximation of the Lorentz-transformed
+**line-charge** field and enables constant-velocity constraint motion. It requires
+exactly one particle and clears old waves. Use `N` or `P` to evolve the result.
+An ordinary velocity edit deliberately preserves the old fields and therefore
+produces a transient instead. See the [relativistic-motion review](docs/relativistic-motion-review.md)
+for the derivation, academic papers, accuracy measurements, and finite-grid limits.
 
 Right-click works directly on stationary and fixed charges, as well as moving
 ones. The charge marker disappears immediately, while E and B remain unchanged
@@ -219,11 +256,25 @@ scales with mass and both species remain easy to manipulate.
   use Higuera–Cary. Magnetic-only motion preserves momentum magnitude to
   roundoff, and finite momentum implies speed below c without a velocity clamp.
   The original `boris` function remains available for regression comparisons.
+- **Controlled tests:** constrained particles store integer-time proper velocity,
+  advance the prescribed coordinate acceleration, and drift at midpoint velocity.
+  They use the same conservative reflected-orbit current deposition. Fixing is
+  the zero-velocity, zero-acceleration instance of this external constraint;
+  it is not an additional physical interaction. The Inspector synchronizes free
+  particles to E's integer time with a temporary Higuera–Cary half-step.
 - **Charge and current:** bilinear cloud-in-cell charge shapes. Every trajectory
   is split at crossed grid lines and at wall collisions. Cell-local orbit fluxes
   satisfy the discrete continuity equation to roundoff. This preserves Gauss's
   law during ordinary timesteps **without periodic divergence cleaning**.
   User-triggered deletion enables the separate removal model described below.
+- **Source filtering:** by default, two passes of `[1, 2, 1]/4` in each axis
+  filter charge density and both current components with the same convolution,
+  preserving discrete continuity and Gauss's law. Force gathering applies the
+  adjoint filter to temporary field copies. Initial/add/remove sources and the
+  steady-motion initializer use the same shape, including hidden-cell tails.
+  The evolved/displayed E/B fields are not blurred each step. Two passes add
+  one cell of RMS source width per axis; close encounters and core fields change.
+  Use `--source-filter 0` for the original CIC shape or `4` for stronger filtering.
 - **Initialization and addition:** a free-space Poisson solve initializes E using
   the infinite-lattice Green function for the same discrete Yee Laplacian.
   Its kernel is computed once by quadrature; a zero-padded FFT convolution then
@@ -359,7 +410,7 @@ Benchmark the numerical kernels separately from the GUI:
 ```
 
 Higuera–Cary measurements on the available ARM64 Mac / Python 3.13.1, after JIT
-warmup and 3,000 physics steps, with the default 32-cell padding:
+warmup and 3,000 physics steps, with 32-cell padding **before source filtering**:
 
 | Charges | Grid | Physics step | Line refresh (median) |
 | --- | --- | --- | --- |
@@ -370,6 +421,9 @@ These are CPU kernel timings, not a guaranteed M2 Air frame rate. Wall-clock
 rendering depends on window resolution, thermals, background load, and driver.
 The 100-charge case kept the Gauss residual below `2e-11` after 3,000 steps.
 Line timings depend on the evolved scene and the number of traced segments.
+With the current two-pass source/gather filter, a warmed 100-charge, 1,000-step
+run measured approximately **0.35 ms/step** and **1.19 ms** median line refresh
+on the available ARM64 Mac. The source filter adds work proportional to grid size.
 Before the pusher upgrade, a separate 100-charge run with removal evolution active measured
 about **0.128 ms per physics step**. Its kernels are compiled during GUI startup
 to avoid a first-deletion compilation pause.
@@ -379,6 +433,10 @@ For a full-window measurement (two-second warmup, then automatic exit):
 ```sh
 .venv/bin/python main.py --charges 100 --profile-seconds 8
 ```
+
+With the current two-pass source filter, a six-second measurement after warmup
+rendered **60.0 FPS** with 100 charges, balanced line detail, and a 2560 × 1578
+framebuffer on the available ARM64 Mac (95th-percentile frame interval 20.6 ms).
 
 Before the pusher upgrade, the available Mac measured about **62 rendered FPS** in a six-second open-field
 run with 100 charges at a 2560 × 1578 Retina framebuffer and balanced line detail.
@@ -392,7 +450,7 @@ Run numerical checks and the real-window integration smoke test:
 .venv/bin/python main.py --smoke-test
 ```
 
-The 34-test numerical suite covers discrete Poisson, continuity for random orbits and
+The 52-test numerical suite covers discrete Poisson, continuity for random orbits and
 cell-boundary endpoints, wall and corner reflection, Boris magnetic invariance,
 electric acceleration, the Yee curls against an analytic mode with test-only
 fixed endpoints, 1,200-step
@@ -400,6 +458,14 @@ constraint preservation, empty scenes, dragging, attraction, and straight
 streamlines. It also checks reset-to-one-charge, fixed sources with zero current,
 release, species mass response and metadata, scalar magnitude/energy formulas,
 magnetic time centering, and color-map zero/sign behavior.
+Inspector checks cover relativistic coordinate acceleration, field-preserving
+velocity edits, constrained trajectories/release, pinning, light-speed rejection,
+an independent electromagnetic tensor boost, and short-run moving-field accuracy.
+Source-filter checks add full-grid continuity at walls, charge normalization,
+adjoint gathering, deletion and hidden tails, source-free wave dispersion,
+longer moving-charge wake reduction, oblique motion, and padding comparisons.
+Run `.venv/bin/python tests/diagnose_solver.py` to reproduce the longer field
+comparison and write its table and heatmap panels under `artifacts/`.
 Open-space checks cover stationary edge charges, translation invariance (no
 conductor-image force), rectangular cells, a non-neutral free-space field, and
 pulse escape compared with a much larger domain after reflected waves could return.
@@ -415,7 +481,7 @@ and initial staggering. Existing continuity and wall-bounce tests also run
 through the new pusher.
 The GUI test exercises add/delete, negative injection, key-repeat
 suppression, force dragging, double-click pin/release, proton/electron injection,
-single-charge reset, all scalar layers, themes, and resizing, then
+single-charge reset, the logarithmic slider and slow playback, all scalar layers, themes, and resizing, then
 writes `artifacts/maxwell-dark.png`, `artifacts/maxwell-light.png`, and a compact
 window preview `artifacts/maxwell-compact.png`. Additional previews show the reset
 scene and electric, magnetic, energy, and signed B canvas modes. The test then exits.

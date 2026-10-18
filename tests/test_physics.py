@@ -152,7 +152,10 @@ class PhysicsTests(unittest.TestCase):
     def test_free_space_poisson_on_rectangular_cells(self):
         # Unequal dx/dy and non-neutral charge must work without a neutralizing
         # background. Check the continuum 2D line-charge field far from its core.
-        sim = Simulation(Config(nx=64, ny=32, width=16, height=4), particles=0)
+        # Isolate the lattice Green function against a narrow line source;
+        # optional source filtering deliberately broadens that source.
+        sim = Simulation(Config(nx=64, ny=32, width=16, height=4,
+                                source_filter_passes=0), particles=0)
         sim.add_charge(4, 2)
         self.assertLess(sim.diagnostics()['gauss_linf'], 5e-12)
         x = (48+.5)*sim.dx

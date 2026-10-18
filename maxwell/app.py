@@ -15,7 +15,8 @@ from pyglet.graphics.shader import Shader, ShaderProgram
 from pyglet.window import key, mouse
 from .fieldlines import build_lines
 from .heatmap import HEAT_TITLES, HEAT_UNITS, scalar_field, field_scale, colorize
-from .physics import SPECIES, PROTON_ELECTRON_MASS_RATIO
+from .physics import SPECIES, PROTON_ELECTRON_MASS_RATIO, AccelerationLimitError
+from .inspector import ParticleInspector
 
 
 THEMES = {
@@ -73,10 +74,15 @@ class FieldWindow(pyglet.window.Window):
         self.heat_mode = 'off'
         self.injection_species = 'charge'
         self.sign, self.speed, self.density = 1, 1., 1
+        self.time_slider = None
+        self.slider_dragging = False
         self.cursor = (-100., -100.)
         self.hovered = -1
         self.keys_down = set()
         self.last_click = None
+        self.drag_candidate, self.drag_start = -1, None
+        self.panel_tab = 'controls'
+        self.inspector = ParticleInspector(self)
         self.accumulator, self.line_age, self.stats_age = 0., 1., 1.
         self.frame_ms, self.physics_ms, self.lines_ms = 16.67, 0., 0.
         self.last_draw = time.perf_counter()
@@ -84,7 +90,7 @@ class FieldWindow(pyglet.window.Window):
         self.record_frames = False
         self.slow = False
         self.line_count = 0
-        self.message = "Drag to apply force. Double-click a charge to fix or release it."
+        self.message = "Click to inspect. Drag to apply force. Double-click to fix or release."
         self.message_until = 0.
         self.program = ShaderProgram(Shader(VERTEX, 'vertex'), Shader(FRAGMENT, 'fragment'))
         self.line_vertices = None
@@ -133,6 +139,8 @@ class FieldWindow(pyglet.window.Window):
         self.buttons[name] = (x, y, w, height, rect, label)
 
     def layout(self):
+        self.time_slider = None
+        self.slider_dragging = False
         for obj in self.chrome_items + self.grid_items:
             obj.delete()
         self.chrome_items, self.grid_items, self.buttons = [], [], {}
@@ -175,39 +183,56 @@ class FieldWindow(pyglet.window.Window):
                    self.oy-17, 8, p['muted'], anchor='right')
         sx, top = w-244, h-126
         self.rect(sx-8, 108, 224, h-224, p['panel'], radius=12)
-        self.label('CONTROLS', sx+10, top-13, 9, p['muted'], bold=True)
+        self.button('tab_controls', 'Controls', sx+8, top-21, 96, self.panel_tab == 'controls', height=24)
+        self.button('tab_inspector', 'Inspector', sx+112, top-21, 96, self.panel_tab == 'inspector', height=24)
         self.button('pause', 'Resume  [P]' if self.paused else 'Pause  [P]', sx+8, top-52, 96)
         self.button('reset', 'Reset  [R]', sx+112, top-52, 96)
-        self.label('ADD AT CURSOR  ·  SPACE', sx+10, top-72, 9, p['muted'])
-        generic = self.injection_species == 'charge'
-        self.button('positive', '+ Charge [1]', sx+8, top-108, 96, generic and self.sign > 0)
-        self.button('negative', '− Charge [2]', sx+112, top-108, 96, generic and self.sign < 0)
-        self.button('proton', 'Proton [3]', sx+8, top-140, 96, self.injection_species == 'proton')
-        self.button('electron', 'Electron [4]', sx+112, top-140, 96, self.injection_species == 'electron')
-        self.label('MASS UNIT: electron mass', sx+10, top-154, 8, p['muted'])
-        self.label('FIELD LAYERS', sx+10, top-177, 9, p['muted'])
-        self.button('lines', 'Lines [E]', sx+8, top-214, 96, self.show_lines)
-        self.button('velocity', 'Velocity [V]', sx+112, top-214, 96, self.show_velocity)
-        self.label('CANVAS COLOR', sx+10, top-235, 9, p['muted'])
-        self.button('heat_off', 'Off', sx+8, top-271, 96, self.heat_mode == 'off')
-        self.button('heat_electric', '|E| [F]', sx+112, top-271, 96, self.heat_mode == 'electric')
-        self.button('heat_magnetic', '|B| [B]', sx+8, top-303, 96, self.heat_mode == 'magnetic')
-        self.button('heat_energy', 'EM energy [U]', sx+112, top-303, 96, self.heat_mode == 'energy')
-        self.button('heat_signed', 'Signed Bz [M]', sx+8, top-335, 200, self.heat_mode == 'signed')
-        if self.heat_mode != 'off':
-            ramp = (51**np.linspace(0, 1, 64)-1)/50
-            if self.heat_mode == 'signed':
-                ramp = np.concatenate((-ramp[::-1], ramp))
-            colors = colorize(ramp, self.heat_mode, 1., p['plot'], self.theme == 'dark')
-            for i, color in enumerate(colors):
-                self.chrome_items.append(shapes.Rectangle(sx+8+i*200/len(colors), top-350,
-                    200/len(colors)+.1, 6, color=tuple(int(c) for c in color), batch=self.chrome,
-                    group=self.bg_group))
-        self.heat_range_label = self.label('', sx+10, top-363, 8, p['muted'])
-        self.label('TIME SCALE', sx+10, top-383, 9, p['muted'])
-        for i, speed in enumerate((.5, 1., 2.)):
-            self.button(f'speed{speed}', f'{speed:g}×', sx+8+i*69, top-419, 62, self.speed == speed)
-        self.button('density', f'Detail: {("low", "balanced", "high")[self.density]}   [D]', sx+8, top-451, 200)
+        if self.panel_tab == 'controls':
+            self.label('ADD AT CURSOR  ·  SPACE', sx+10, top-72, 9, p['muted'])
+            generic = self.injection_species == 'charge'
+            self.button('positive', '+ Charge [1]', sx+8, top-108, 96, generic and self.sign > 0)
+            self.button('negative', '− Charge [2]', sx+112, top-108, 96, generic and self.sign < 0)
+            self.button('proton', 'Proton [3]', sx+8, top-140, 96, self.injection_species == 'proton')
+            self.button('electron', 'Electron [4]', sx+112, top-140, 96, self.injection_species == 'electron')
+            self.label('MASS UNIT: electron mass', sx+10, top-154, 8, p['muted'])
+            self.label('FIELD LAYERS', sx+10, top-177, 9, p['muted'])
+            self.button('lines', 'Lines [E]', sx+8, top-214, 96, self.show_lines)
+            self.button('velocity', 'Velocity [V]', sx+112, top-214, 96, self.show_velocity)
+            self.label('CANVAS COLOR', sx+10, top-235, 9, p['muted'])
+            self.button('heat_off', 'Off', sx+8, top-271, 96, self.heat_mode == 'off')
+            self.button('heat_electric', '|E| [F]', sx+112, top-271, 96, self.heat_mode == 'electric')
+            self.button('heat_magnetic', '|B| [B]', sx+8, top-303, 96, self.heat_mode == 'magnetic')
+            self.button('heat_energy', 'EM energy [U]', sx+112, top-303, 96, self.heat_mode == 'energy')
+            self.button('heat_signed', 'Signed Bz [M]', sx+8, top-335, 200, self.heat_mode == 'signed')
+            if self.heat_mode != 'off':
+                ramp = (51**np.linspace(0, 1, 64)-1)/50
+                if self.heat_mode == 'signed':
+                    ramp = np.concatenate((-ramp[::-1], ramp))
+                colors = colorize(ramp, self.heat_mode, 1., p['plot'], self.theme == 'dark')
+                for i, color in enumerate(colors):
+                    self.chrome_items.append(shapes.Rectangle(sx+8+i*200/len(colors), top-350,
+                        200/len(colors)+.1, 6, color=tuple(int(c) for c in color), batch=self.chrome,
+                        group=self.bg_group))
+            self.heat_range_label = self.label('', sx+10, top-363, 8, p['muted'])
+            self.label('TIME SCALE · log₂', sx+10, top-383, 9, p['muted'])
+            self.speed_label = self.label(f'{self.speed:.4g}×', sx+204, top-383,
+                                          9, p['accent'], anchor='right')
+            x, y, width = sx+16, top-402, 184
+            self.time_slider = (x, y, width)
+            fraction = (math.log2(self.speed)+5)/6
+            self.rect(x, y-1.5, width, 3, p['border'], radius=1)
+            self.speed_fill = self.rect(x, y-1.5, width*fraction, 3, p['accent'], radius=1)
+            self.speed_knob = shapes.Circle(x+width*fraction, y, 6, color=p['accent'],
+                                           batch=self.chrome, group=self.text_group)
+            self.chrome_items.append(self.speed_knob)
+            for i, caption in enumerate(('1/32', '1/16', '1/8', '1/4', '1/2', '1', '2')):
+                tick = x+width*i/6
+                self.chrome_items.append(shapes.Line(tick, y-5, tick, y-2, thickness=1,
+                    color=p['muted'], batch=self.chrome, group=self.text_group))
+                self.label(caption, tick, y-14, 7, p['muted'], anchor='center')
+            self.button('density', f'Detail: {("low", "balanced", "high")[self.density]}   [D]', sx+8, top-451, 200)
+        else:
+            self.inspector.draw(sx, top)
         self.stats_label = self.label('', sx+10, top-473, 9, p['muted'])
         self.time_label = self.label('', sx+10, top-493, 9, p['muted'])
         self.error_label = self.label('', sx+10, top-513, 9, p['muted'])
@@ -291,7 +316,7 @@ class FieldWindow(pyglet.window.Window):
             color = p['positive'] if sim.charge[i] > 0 else p['negative']
             halo, dot, horizontal, vertical, ring, species_label = objects
             halo.position = dot.position = x, y
-            halo.color = (*color, 65 if i == self.hovered or i == sim.dragged else 23)
+            halo.color = (*color, 65 if i in (self.hovered, sim.dragged, self.inspector.selected) else 23)
             dot.color = color
             dot.radius = max(6., min(10., sim.radius*self.world_scale*.7))
             horizontal.position, horizontal.x2, horizontal.y2 = (x-3, y), x+3, y
@@ -333,6 +358,8 @@ class FieldWindow(pyglet.window.Window):
         if i < 0:
             return
         self.sim.remove_charge(i)
+        self.inspector.deleted(i)
+        self.drag_candidate = -1
         self.last_click = None
         self.hovered = -1
         self.refresh_field()
@@ -344,13 +371,23 @@ class FieldWindow(pyglet.window.Window):
 
     def action(self, name):
         self.last_click = None
-        if name == 'theme':
+        self.drag_candidate = -1
+        if name.startswith('tab_'):
+            self.panel_tab = name[4:]
+            self.inspector.cancel()
+        elif name.startswith('inspect_'):
+            self.inspector.action(name)
+        elif name == 'theme':
             self.theme = 'light' if self.theme == 'dark' else 'dark'
         elif name == 'pause':
+            if self.paused and (self.inspector.editor is not None or self.inspector.dirty):
+                self.notice('Apply or discard Inspector edits before resuming.')
+                return
             self.paused = not self.paused
             self.accumulator = 0
         elif name == 'reset':
             self.sim.reset_to_single_positive()
+            self.inspector.select(-1)
             self.accumulator = 0
             self.injection_species, self.sign = 'charge', 1
             self.notice('Reset: one free positive charge at the center.')
@@ -375,8 +412,6 @@ class FieldWindow(pyglet.window.Window):
             self.show_velocity = not self.show_velocity
         elif name == 'density':
             self.density = (self.density+1) % 3
-        elif name.startswith('speed'):
-            self.speed = float(name[5:])
         self.layout()
         self.refresh_field()
         self.sync_particles()
@@ -407,36 +442,57 @@ class FieldWindow(pyglet.window.Window):
     def on_mouse_press(self, x, y, button, modifiers):
         self.cursor = x, y
         if button == mouse.LEFT:
+            if self.time_slider is not None:
+                sx, sy, width = self.time_slider
+                if sx-8 <= x <= sx+width+8 and abs(y-sy) <= 10:
+                    self.slider_dragging = True
+                    self.sim.dragged = self.drag_candidate = -1
+                    self.last_click = None
+                    self.set_time_scale_from_cursor(x)
+                    return
             for name, (bx, by, w, h, _, _) in self.buttons.items():
                 if bx <= x <= bx+w and by <= y <= by+h:
                     self.action(name)
                     return
             i, now = self.pick(x, y), time.perf_counter()
             previous = self.last_click
+            self.sim.dragged = -1
+            self.drag_candidate, self.drag_start = i, (x, y)
+            if i >= 0:
+                self.inspector.select(i)
+                self.panel_tab = 'inspector'
+                self.layout()
             if (i >= 0 and previous is not None and previous[0] == i
                     and now-previous[1] <= .35
                     and math.hypot(x-previous[2], y-previous[3]) <= 8):
                 fixed = self.sim.toggle_fixed(i)
                 self.last_click = None
-                self.notice('Charge fixed in space; double-click to release.' if fixed
+                self.drag_candidate = -1
+                self.notice('Constraint ON: v = a = 0. Charge fixed in space; double-click to release.' if fixed
                             else 'Charge released from rest; Lorentz forces apply again.')
                 self.sync_particles()
                 self.update_stats()
                 return
             self.last_click = (i, now, x, y) if i >= 0 else None
-            self.sim.dragged = i if i >= 0 and not self.sim.fixed[i] else -1
             self.sim.target[:] = self.world(x, y)
-            if i >= 0 and self.sim.fixed[i]:
-                self.notice('This charge is fixed. Double-click it to release.')
-            if self.sim.dragged >= 0 and self.paused:
-                self.notice('Paused. Press P to resume, or N to advance one step with the drag force.')
         elif button == mouse.RIGHT:
             self.delete_at_cursor()
 
     def on_mouse_drag(self, x, y, dx, dy, buttons, modifiers):
         self.cursor = x, y
-        if self.last_click is not None and math.hypot(x-self.last_click[2], y-self.last_click[3]) > 5:
-            self.last_click = None  # A drag is not the first half of a double-click.
+        if self.slider_dragging:
+            self.set_time_scale_from_cursor(x)
+            return
+        if (buttons & mouse.LEFT and self.drag_candidate >= 0 and self.drag_start is not None
+                and math.hypot(x-self.drag_start[0], y-self.drag_start[1]) > 5):
+            self.last_click = None  # Selection alone never applies a force.
+            if self.sim.prescribed[self.drag_candidate]:
+                self.notice('Disable Constraint Mode in Inspector to drag this charge.')
+                self.drag_candidate = -1
+            else:
+                self.sim.dragged = self.drag_candidate
+                if self.paused:
+                    self.notice('Paused. P resumes; N advances one step with the drag force.')
         if self.sim.dragged >= 0:
             cfg, r = self.sim.config, self.sim.radius
             wx, wy = self.world(x, y)
@@ -444,16 +500,50 @@ class FieldWindow(pyglet.window.Window):
 
     def on_mouse_release(self, x, y, button, modifiers):
         if button == mouse.LEFT:
+            if self.slider_dragging:
+                self.set_time_scale_from_cursor(x)
+            self.slider_dragging = False
             self.sim.dragged = -1
+            self.drag_candidate = -1
 
     def on_deactivate(self):
         if self.ready:
+            self.slider_dragging = False
             self.sim.dragged = -1
+            self.drag_candidate = -1
             self.keys_down.clear()
             self.accumulator = 0
             self.last_click = None
 
+    def set_time_scale_from_cursor(self, x):
+        """Continuous log2 scale; adjust simulated time, never the CFL step."""
+        if self.time_slider is None:
+            return
+        left, _, width = self.time_slider
+        fraction = min(1., max(0., (x-left)/width))
+        self.speed = 2.**(-5+6*fraction)
+        self.speed_knob.x = left+width*fraction
+        self.speed_fill.width = width*fraction
+        self.speed_label.text = f'{self.speed:.4g}×'
+
+    def on_text(self, text):
+        self.inspector.text(text)
+
     def on_key_press(self, symbol, modifiers):
+        if self.inspector.editor is not None:
+            if symbol in (key.ENTER, key.RETURN, key.NUM_ENTER):
+                self.action('inspect_apply')
+            elif symbol == key.ESCAPE:
+                self.action('inspect_cancel')
+            elif symbol in (key.BACKSPACE, key.DELETE):
+                self.inspector.backspace()
+            elif symbol == key.TAB:
+                names = self.inspector.names
+                offset = -1 if modifiers & key.MOD_SHIFT else 1
+                self.action('inspect_edit_'+names[(names.index(self.inspector.editor)+offset) % 4])
+            elif symbol == key.A and modifiers & (key.MOD_CTRL | key.MOD_COMMAND):
+                self.inspector.replace_text = True
+            return  # Text-entry keys must not invoke simulation shortcuts.
         if symbol in self.keys_down:
             return  # One particle per actual press, not operating-system key repeat.
         self.keys_down.add(symbol)
@@ -476,7 +566,7 @@ class FieldWindow(pyglet.window.Window):
         elif symbol in (key.BACKSPACE, key.DELETE):
             self.delete_at_cursor()
         elif symbol == key.N and self.paused:
-            self.sim.step()
+            self.advance_simulation(1)
             self.refresh_field()
             self.sync_particles()
             self.update_stats()
@@ -486,7 +576,19 @@ class FieldWindow(pyglet.window.Window):
     def on_key_release(self, symbol, modifiers):
         self.keys_down.discard(symbol)
 
+    def advance_simulation(self, count):
+        try:
+            self.sim.step(count)
+            return True
+        except AccelerationLimitError as error:
+            self.paused, self.accumulator = True, 0
+            self.notice(str(error))
+            self.layout()
+            self.refresh_field()
+            return False
+
     def update_stats(self):
+        self.inspector.refresh()
         d = self.sim.diagnostics()
         self.stats_label.text = f'{d["particles"]} charges · {np.count_nonzero(self.sim.fixed)} fixed · vmax {d["max_speed_over_c"]:.2f}c'
         self.time_label.text = f't = {self.sim.time:7.2f}    ·    dt {self.sim.dt:.4f}'
@@ -510,8 +612,8 @@ class FieldWindow(pyglet.window.Window):
             self.accumulator += min(elapsed, .1)*self.speed
             count = min(12, int(self.accumulator/self.sim.dt))
             if count:
-                self.sim.step(count)
-                self.accumulator -= count*self.sim.dt
+                if self.advance_simulation(count):
+                    self.accumulator -= count*self.sim.dt
             if self.accumulator > 12*self.sim.dt:
                 self.slow = True
                 self.accumulator = self.sim.dt
@@ -527,7 +629,7 @@ class FieldWindow(pyglet.window.Window):
             self.stats_age = 0
         if self.message_until and time.perf_counter() > self.message_until:
             self.message_until = 0
-            self.message = 'Drag to apply force. Double-click a charge to fix or release it.'
+            self.message = 'Click to inspect. Drag to apply force. Double-click to fix or release.'
             self.message_label.text = self.message
 
     def draw_vectors(self):

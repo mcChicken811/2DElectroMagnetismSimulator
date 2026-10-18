@@ -1,19 +1,33 @@
-"""Yee Maxwell solver with CIC charge and exactly conservative orbit currents.
+"""Yee Maxwell solver with filtered CIC sources and conservative orbit currents.
 
 Coordinates: rho[i,j] is nodal; Ex[i,j] is at (i+1/2,j), Ey[i,j]
 at (i,j+1/2), Bz[i,j] at (i+1/2,j+1/2). E and positions are at
-integer times; momentum and B are staggered by half a step.
+integer times; momentum and B are staggered by half a step. Prescribed-motion
+test particles instead store integer-time momentum and bypass the force push.
 """
 from dataclasses import dataclass
 import math
 import numpy as np
 from numba import njit
 from .open_boundary import free_space_kernel, free_space_potential, apply_mur_boundary
+from .filtering import binomial_filter
 
 # CODATA 2022: https://physics.nist.gov/cgi-bin/cuu/Value?mpsme
 # Masses are measured in electron masses. Keep the existing charge/field scale.
 PROTON_ELECTRON_MASS_RATIO = 1836.152673426
 SPECIES = {'charge': 0, 'proton': 1, 'electron': 2}
+
+
+class AccelerationLimitError(ValueError):
+    """A prescribed coordinate acceleration would reach the speed of light."""
+
+
+@njit(cache=True)
+def drag_force(x, y, ux, uy, c, target):
+    gamma = math.sqrt(1+(ux*ux+uy*uy)/(c*c))
+    fx, fy = 90*(target[0]-x)-16*ux/gamma, 90*(target[1]-y)-16*uy/gamma
+    scale = min(1.0, 180.0/max(math.hypot(fx, fy), 1e-15))
+    return fx*scale, fy*scale
 
 
 @njit(cache=True)
@@ -194,7 +208,8 @@ def apply_removal_wave(ex, ey, psi, dx, dy, dt):
 
 @njit(cache=True)
 def push_particles(pos, momentum, charge, mass, fixed, ex, ey, bz, jx, jy,
-                   dx, dy, dt, c, width, height, radius, dragged, target):
+                   dx, dy, dt, c, width, height, radius, dragged, target,
+                   prescribed=None, acceleration=None):
     jx[:] = 0.0
     jy[:] = 0.0
     for p in range(len(charge)):
@@ -208,16 +223,24 @@ def push_particles(pos, momentum, charge, mass, fixed, ex, ey, bz, jx, jy,
         magnetic = sample(bz, x, y, dx, dy, 0.5, 0.5)
         fx, fy = 0.0, 0.0
         if p == dragged:
-            g = math.sqrt(1+np.sum(momentum[p]**2)/(c*c))
             # A damped, force-limited spring lets the user inject real momentum.
-            fx = 90*(target[0]-x)-16*momentum[p, 0]/g
-            fy = 90*(target[1]-y)-16*momentum[p, 1]/g
-            scale = min(1.0, 180.0/max(math.hypot(fx, fy), 1e-15))
-            fx, fy = fx*scale, fy*scale
-        ux, uy = higuera_cary(momentum[p, 0], momentum[p, 1], electric_x,
-                             electric_y, magnetic, charge[p]/mass[p], dt, c, fx, fy)
-        gamma = math.sqrt(1+(ux*ux+uy*uy)/(c*c))
-        x, y, sx, sy = drift_reflect(x, y, ux/gamma, uy/gamma, charge[p],
+            fx, fy = drag_force(x, y, momentum[p, 0], momentum[p, 1], c, target)
+        if prescribed is not None and prescribed[p]:
+            # Explicit external trajectory constraint for controlled tests.
+            # Store integer-time velocity, drift at the midpoint, and preserve
+            # the existing reflected orbit and exactly conservative current.
+            g = math.sqrt(1+np.sum(momentum[p]**2)/(c*c))
+            vx = momentum[p, 0]/g+dt*acceleration[p, 0]
+            vy = momentum[p, 1]/g+dt*acceleration[p, 1]
+            drift_x, drift_y = vx-.5*dt*acceleration[p, 0], vy-.5*dt*acceleration[p, 1]
+            g = 1/math.sqrt(1-(vx*vx+vy*vy)/(c*c))
+            ux, uy = g*vx, g*vy
+        else:
+            ux, uy = higuera_cary(momentum[p, 0], momentum[p, 1], electric_x,
+                                 electric_y, magnetic, charge[p]/mass[p], dt, c, fx, fy)
+            gamma = math.sqrt(1+(ux*ux+uy*uy)/(c*c))
+            drift_x, drift_y = ux/gamma, uy/gamma
+        x, y, sx, sy = drift_reflect(x, y, drift_x, drift_y, charge[p],
                                     jx, jy, dx, dy, dt, width, height, radius)
         pos[p, 0], pos[p, 1] = x, y
         momentum[p, 0], momentum[p, 1] = sx*ux, sy*uy
@@ -234,6 +257,7 @@ class Config:
     charge: float = 2.5
     mass: float = 1.0
     field_padding: int = 32
+    source_filter_passes: int = 2
 
     def __post_init__(self):
         if self.nx < 16 or self.ny < 16:
@@ -244,6 +268,9 @@ class Config:
             raise ValueError("CFL safety factor must be between 0 and 1.")
         if not isinstance(self.field_padding, int) or self.field_padding < 4:
             raise ValueError("Field padding must be an integer of at least 4 cells.")
+        if (not isinstance(self.source_filter_passes, int)
+                or not 0 <= self.source_filter_passes <= 4):
+            raise ValueError('Source filtering must be an integer from 0 to 4 passes.')
 
 
 class Simulation:
@@ -295,6 +322,8 @@ class Simulation:
         self.charge = np.where(np.arange(particles) % 2 == 0, cfg.charge, -cfg.charge)
         self.mass = np.full(particles, cfg.mass)
         self.fixed = np.zeros(particles, dtype=np.bool_)
+        self.prescribed = np.zeros(particles, dtype=np.bool_)
+        self.prescribed_acceleration = np.zeros((particles, 2))
         self.species = np.full(particles, SPECIES['charge'], dtype=np.int8)
         v = rng.normal(0, 0.22, (particles, 2))
         v *= np.minimum(1.0, (0.4*cfg.c)/np.maximum(np.linalg.norm(v, axis=1), 1e-12))[:, None]
@@ -315,30 +344,127 @@ class Simulation:
         self.add_charge(self.config.width/2, self.config.height/2)
 
     def toggle_fixed(self, index):
-        """An external support arrests motion; removing it releases from rest."""
+        """Shortcut for constraint mode with v=a=0, or release that constraint."""
         if not 0 <= index < len(self.charge):
             raise IndexError('Charge index out of range.')
-        self.fixed[index] = not self.fixed[index]
-        self.momentum[index] = 0.0
-        if self.dragged == index:
-            self.dragged = -1
-        if not self.fixed[index]:
-            self._stagger_initial_momentum([index])
+        if self.fixed[index]:
+            self.release_motion(index)
+        else:
+            self.set_motion(index, velocity=np.zeros(2), acceleration=np.zeros(2))
         return bool(self.fixed[index])
 
     def _stagger_initial_momentum(self, indices):
         """Convert specified initial u(t) to the pusher's u(t-dt/2)."""
+        electric_x, electric_y, magnetic = self.force_fields()
         for i in indices:
             x, y = self.pos[i]
-            ex = sample(self.ex, x, y, self.dx, self.dy, .5, 0.)
-            ey = sample(self.ey, x, y, self.dx, self.dy, 0., .5)
-            bz = sample(self.bz, x, y, self.dx, self.dy, .5, .5)
+            ex = sample(electric_x, x, y, self.dx, self.dy, .5, 0.)
+            ey = sample(electric_y, x, y, self.dx, self.dy, 0., .5)
+            bz = sample(magnetic, x, y, self.dx, self.dy, .5, .5)
             self.momentum[i] = higuera_cary(*self.momentum[i], ex, ey, bz,
                                            self.charge[i]/self.mass[i], -self.dt/2,
                                            self.config.c)
 
+    def magnetic_now(self, full=False):
+        """B at E's integer time, without altering the staggered solver state."""
+        ex, ey, bz = (self._ex, self._ey, self._bz) if full else (self.ex, self.ey, self.bz)
+        curl = np.diff(ey, axis=0)/self.dx-np.diff(ex, axis=1)/self.dy
+        return bz-.5*self.dt*curl
+
+    def force_fields(self, magnetic=None):
+        """Gather with the adjoint of the source filter, including hidden cells.
+
+        These are temporary copies, not changes to the evolved Maxwell fields.
+        """
+        if magnetic is None:
+            magnetic = self.magnetic_now(full=True)
+        p, passes = self.config.field_padding, self.config.source_filter_passes
+        return tuple(binomial_filter(a, passes)[p:-p, p:-p]
+                     for a in (self._ex, self._ey, magnetic))
+
+    def particle_state(self, index):
+        """Integer-time v and coordinate acceleration dv/dt, not du/dt.
+
+        Wall reflections and user velocity edits are impulses, not finite
+        accelerations. Fixed particles have zero actual v and acceleration.
+        """
+        if not 0 <= index < len(self.charge):
+            raise IndexError('Charge index out of range.')
+        if self.fixed[index]:
+            return np.zeros(2), np.zeros(2)
+        c = self.config.c
+        if self.prescribed[index]:
+            return self.velocity[index].copy(), self.prescribed_acceleration[index].copy()
+        x, y = self.pos[index]
+        electric_x, electric_y, magnetic = self.force_fields()
+        ex = sample(electric_x, x, y, self.dx, self.dy, .5, 0.)
+        ey = sample(electric_y, x, y, self.dx, self.dy, 0., .5)
+        bz = sample(magnetic, x, y, self.dx, self.dy, .5, .5)
+        fx, fy = (drag_force(x, y, *self.momentum[index], c, self.target)
+                  if index == self.dragged else (0., 0.))
+        u = np.array(higuera_cary(*self.momentum[index], ex, ey, bz,
+                                  self.charge[index]/self.mass[index], self.dt/2, c, fx, fy))
+        gamma = math.sqrt(1+np.dot(u, u)/c**2)
+        v = u/gamma
+        external = (np.array(drag_force(x, y, *u, c, self.target))
+                    if index == self.dragged else np.zeros(2))
+        force_per_mass = self.charge[index]/self.mass[index]*np.array(
+            [ex+v[1]*bz, ey-v[0]*bz])+external
+        a = (force_per_mass-v*np.dot(v, force_per_mass)/c**2)/gamma
+        return v, a
+
+    def set_motion(self, index, velocity=None, acceleration=None):
+        """External edit at current time; E, B, position, and time are preserved.
+
+        Editing acceleration enables a prescribed TOTAL lab acceleration.
+        None leaves the existing mode unchanged; use release_motion for forces.
+        All validation precedes mutation, including the next prescribed step.
+        """
+        current_v, _ = self.particle_state(index)
+        v = current_v if velocity is None else np.asarray(velocity, dtype=float)
+        a = (self.prescribed_acceleration[index].copy() if acceleration is None
+             else np.asarray(acceleration, dtype=float))
+        if v.shape != (2,) or a.shape != (2,) or not np.all(np.isfinite(v)) or not np.all(np.isfinite(a)):
+            raise ValueError('Velocity and acceleration must be finite x/y values.')
+        controlled = self.prescribed[index] or acceleration is not None
+        c = self.config.c
+        candidates = (v, v+self.dt*a) if controlled else (v,)
+        if any(np.linalg.norm(value) >= c for value in candidates):
+            raise ValueError('Speed must stay below c, including the next step. Reduce v or a.')
+        self.dragged = -1
+        self.prescribed[index] = controlled
+        self.prescribed_acceleration[index] = a
+        self.fixed[index] = controlled and np.all(v == 0) and np.all(a == 0)
+        self.momentum[index] = v/math.sqrt(1-np.dot(v, v)/c**2)
+        if not controlled:
+            self._stagger_initial_momentum([index])
+
+    def release_motion(self, index):
+        """Remove the acceleration constraint while preserving current v."""
+        v, _ = self.particle_state(index)
+        self.prescribed[index] = False
+        self.prescribed_acceleration[index] = 0
+        self.fixed[index] = False
+        self.set_motion(index, velocity=v)
+
+    def set_constraint(self, index, enabled):
+        """Toggle external prescribed motion; enabling starts with a=0."""
+        if enabled:
+            self.set_motion(index, acceleration=np.zeros(2))
+        else:
+            self.release_motion(index)
+
     def update_rho(self):
+        self._rho[:] = 0.0  # Clear tails in the hidden cells before redepositing.
         deposit_charge(self.pos, self.charge, self.rho, self.dx, self.dy)
+        self._rho[:] = binomial_filter(self._rho, self.config.source_filter_passes)
+
+    def charge_source(self, pos, charge):
+        """A filtered contribution on the FULL grid, including source tails."""
+        source = np.zeros_like(self._rho)
+        p = self.config.field_padding
+        deposit_charge(pos, charge, source[p:-p, p:-p], self.dx, self.dy)
+        return binomial_filter(source, self.config.source_filter_passes)
 
     def divergence(self):
         return ((self.ex[1:, 1:-1]-self.ex[:-1, 1:-1])/self.dx
@@ -352,10 +478,7 @@ class Simulation:
         Adding a charge must not erase a previous deletion's travelling defect.
         Deletion never calls this instantaneous Poisson correction.
         """
-        nx, ny = self._bz.shape
-        p = self.config.field_padding
-        residual = np.zeros((nx+1, ny+1))
-        residual[p:-p, p:-p] = self.rho if added_rho is None else added_rho
+        residual = (self._rho if added_rho is None else added_rho).copy()
         if added_rho is None:
             residual[1:-1, 1:-1] -= (
                 np.diff(self._ex[:, 1:-1], axis=0)/self.dx
@@ -380,10 +503,11 @@ class Simulation:
         self.charge = np.append(self.charge, cfg.charge*sign)
         self.mass = np.append(self.mass, mass)
         self.fixed = np.append(self.fixed, False)
+        self.prescribed = np.append(self.prescribed, False)
+        self.prescribed_acceleration = np.vstack((self.prescribed_acceleration, [0., 0.]))
         self.species = np.append(self.species, np.int8(SPECIES[species]))
         self.update_rho()
-        added_rho = np.zeros_like(self.rho)
-        deposit_charge(self.pos[-1:], self.charge[-1:], added_rho, self.dx, self.dy)
+        added_rho = self.charge_source(self.pos[-1:], self.charge[-1:])
         self.correct_gauss(added_rho)
         self._stagger_initial_momentum([len(self.charge)-1])
         return len(self.charge)-1
@@ -397,19 +521,18 @@ class Simulation:
         not a physical charge-annihilation process. Fixed particles work too.
         """
         if 0 <= index < len(self.charge):
-            removed_rho = np.zeros_like(self.rho)
-            deposit_charge(self.pos[index:index+1], self.charge[index:index+1],
-                           removed_rho, self.dx, self.dy)
-            p = self.config.field_padding
+            removed_rho = self.charge_source(self.pos[index:index+1], self.charge[index:index+1])
             # Change the half-step representation without changing psi(t_now).
             # This gives the first E update its correct half-sized initial kick.
-            self._removal_psi[p:-p, p:-p] += .5*self.dt*self.config.c**2*removed_rho
+            self._removal_psi += .5*self.dt*self.config.c**2*removed_rho
             self.removal_active = True
             self.pos = np.delete(self.pos, index, axis=0)
             self.momentum = np.delete(self.momentum, index, axis=0)
             self.charge = np.delete(self.charge, index)
             self.mass = np.delete(self.mass, index)
             self.fixed = np.delete(self.fixed, index)
+            self.prescribed = np.delete(self.prescribed, index)
+            self.prescribed_acceleration = np.delete(self.prescribed_acceleration, index, axis=0)
             self.species = np.delete(self.species, index)
             self.dragged = -1
             self.update_rho()
@@ -417,6 +540,11 @@ class Simulation:
     def step(self, count=1):
         cfg = self.config
         for _ in range(count):
+            active = self.prescribed & ~self.fixed
+            if np.any(active):
+                end_v = self.velocity[active]+self.dt*self.prescribed_acceleration[active]
+                if np.any(np.linalg.norm(end_v, axis=1) >= cfg.c):
+                    raise AccelerationLimitError('Prescribed acceleration would reach c. Reduce v or a, or use Lorentz motion.')
             advance_b(self._ex, self._ey, self._bz, self._centered_b, self.dx, self.dy, self.dt)
             apply_mur_boundary(self._bz, self._centered_b, self.dx, self.dy, self.dt, cfg.c)
             if self.removal_active:
@@ -426,10 +554,16 @@ class Simulation:
                                      self.dx, self.dy, self.dt, cfg.c)
                 apply_mur_boundary(self._removal_psi, self._centered_psi,
                                    self.dx, self.dy, self.dt, cfg.c)
+            self._jx[:] = 0.0
+            self._jy[:] = 0.0
+            electric_x, electric_y, magnetic = self.force_fields(self._centered_b)
             push_particles(self.pos, self.momentum, self.charge, self.mass, self.fixed,
-                           self.ex, self.ey, self.centered_b, self.jx, self.jy,
+                           electric_x, electric_y, magnetic, self.jx, self.jy,
                            self.dx, self.dy, self.dt, cfg.c, cfg.width, cfg.height,
-                           self.radius, self.dragged, self.target)
+                           self.radius, self.dragged, self.target,
+                           self.prescribed, self.prescribed_acceleration)
+            self._jx[:] = binomial_filter(self._jx, cfg.source_filter_passes)
+            self._jy[:] = binomial_filter(self._jy, cfg.source_filter_passes)
             advance_e(self._ex, self._ey, self._bz, self._jx, self._jy,
                       self.dx, self.dy, self.dt, cfg.c)
             if self.removal_active:

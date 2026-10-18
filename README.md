@@ -211,10 +211,14 @@ scales with mass and both species remain easy to manipulate.
 - **Fields:** second-order Yee finite differences with a fixed leapfrog timestep
   `dt = 0.75 / (c sqrt(dx⁻² + dy⁻²))`. The CFL limit is respected independently
   of rendering rate or time scale. Fields use float64 throughout.
-- **Particles:** relativistic Boris kicks and magnetic rotation, with
-  time-centered magnetic gathering and staggered momentum. A magnetic-only
-  force preserves momentum magnitude to roundoff, and finite momentum implies
-  speed below c without an artificial velocity clamp.
+- **Particles:** the Higuera–Cary relativistic pusher, with time-centered
+  magnetic gathering and staggered proper velocity `u = gamma*v`. It uses the
+  existing electric half-kicks and magnetic rotation, with a momentum-centered
+  rotation factor that preserves force-balanced relativistic `E × B` drift.
+  Both ordinary pushes and the backward half-step for initialization/release
+  use Higuera–Cary. Magnetic-only motion preserves momentum magnitude to
+  roundoff, and finite momentum implies speed below c without a velocity clamp.
+  The original `boris` function remains available for regression comparisons.
 - **Charge and current:** bilinear cloud-in-cell charge shapes. Every trajectory
   is split at crossed grid lines and at wall collisions. Cell-local orbit fluxes
   satisfy the discrete continuity equation to roundoff. This preserves Gauss's
@@ -254,18 +258,33 @@ scales with mass and both species remain easy to manipulate.
   Only momentum normal to the wall changes sign; both components reverse at a
   corner. These walls are a mechanical constraint, not an EM material.
 - **Dragging:** a spring with acceleration `90(target − x) − 16v`, limited to
-  magnitude 180, adds external force through the Boris kicks. It injects/removes
+  magnitude 180, adds external force through the pusher's half-kicks. It injects/removes
   physical momentum and energy; it does not teleport the particle.
 - **Fixed particles:** a single early-out in the particle loop keeps position
   constant and momentum zero. Charge deposition still includes them. Pin/release
   is an external constraint that can remove kinetic energy; it leaves Gauss's
-  law intact. The Yee curls, orbit-current deposition, Boris rotation, and RK4
-  streamline algorithms are unchanged by the pinning/species/color additions.
+  law intact. The pinning, species, field solver, current deposition, and RK4
+  streamline algorithms are unchanged by the Higuera–Cary upgrade.
 - **Field lines:** bilinear gathering from the staggered E grid, followed by
   adaptive RK4 with step-doubling error estimates. The local tolerance is
   `0.004 min(dx,dy)`; steps range from `0.06` to `1.2` cell widths. Traces stop
   at the viewing edge, charge cores, unresolved nulls, closed loops, or a finite
   work budget.
+
+The pusher follows [Higuera & Cary (2017)](https://arxiv.org/abs/1701.05605).
+For this xy-motion/Bz model, let `u− = uold + dt*(qE/m + Fmanual/m)/2`,
+`tau = q*Bz*dt/(2m)`, and `sigma = 1 + |u−|²/c² − tau²`. The rotation uses
+`gamma_bar² = [sigma + sqrt(sigma² + 4*tau²)]/2` and `t = tau/gamma_bar`.
+The general parallel-momentum term vanishes because `u− · B = 0` here. The
+code evaluates an algebraically equivalent, rationalized root for negative
+sigma to avoid cancellation in strong magnetic fields. This improves the
+pusher's crossed-field behavior; it does not eliminate field-grid, gathering,
+or finite-timestep errors, or make the coupled PIC system exactly energy conserving.
+
+The field-line implementation and the near-overlapping dipole investigation
+are described in [the field-line review](docs/fieldlines-review.md). The review
+includes the integration equation, seeding and stopping rules, and a quantitative
+comparison with the analytical 2D dipole. No field-line algorithm was changed.
 
 The deletion behavior is a **numerical editing model**, not physical annihilation
 of an isolated charge. Maxwell's equations require charge continuity; deleting
@@ -284,7 +303,7 @@ radiation. A finite grid cannot be made infinite simply by deleting boundary
 assignments. The Mur termination can reflect oblique, poorly resolved, or
 low-frequency fields; accuracy near moving charges and over long runs should
 be checked by increasing `--field-padding` and refining the mesh. This small
-boundary treatment preserves the existing Yee/Boris/orbit algorithms and avoids
+boundary treatment preserves the existing Yee/pusher/orbit algorithms and avoids
 introducing a PML subsystem. For the tested smooth circular pulse, the visible
 field-difference energy against a much larger reference domain was below 0.02%
 of the initial pulse energy at the sampled times through t=6. That figure is a
@@ -339,19 +358,19 @@ Benchmark the numerical kernels separately from the GUI:
 .venv/bin/python main.py --benchmark --charges 100 --steps 3000
 ```
 
-Open-field measurements on the available ARM64 Mac / Python 3.13.1, after JIT warmup,
-with the default 32-cell padding:
+Higuera–Cary measurements on the available ARM64 Mac / Python 3.13.1, after JIT
+warmup and 3,000 physics steps, with the default 32-cell padding:
 
 | Charges | Grid | Physics step | Line refresh (median) |
 | --- | --- | --- | --- |
-| 6 | 128 × 80 | 0.058 ms | 2.67 ms |
-| 100 | 128 × 80 | 0.065 ms | 1.15 ms |
+| 6 | 128 × 80 | 0.060 ms | 5.18 ms |
+| 100 | 128 × 80 | 0.063 ms | 1.93 ms |
 
 These are CPU kernel timings, not a guaranteed M2 Air frame rate. Wall-clock
 rendering depends on window resolution, thermals, background load, and driver.
 The 100-charge case kept the Gauss residual below `2e-11` after 3,000 steps.
 Line timings depend on the evolved scene and the number of traced segments.
-With the optional removal evolution active, a separate 100-charge run measured
+Before the pusher upgrade, a separate 100-charge run with removal evolution active measured
 about **0.128 ms per physics step**. Its kernels are compiled during GUI startup
 to avoid a first-deletion compilation pause.
 
@@ -361,7 +380,7 @@ For a full-window measurement (two-second warmup, then automatic exit):
 .venv/bin/python main.py --charges 100 --profile-seconds 8
 ```
 
-The available Mac measured about **62 rendered FPS** in a six-second open-field
+Before the pusher upgrade, the available Mac measured about **62 rendered FPS** in a six-second open-field
 run with 100 charges at a 2560 × 1578 Retina framebuffer and balanced line detail.
 Presentation uses vsync;
 the Cocoa event loop polls at 120 Hz to avoid alternate-tick timer throttling.
@@ -373,7 +392,7 @@ Run numerical checks and the real-window integration smoke test:
 .venv/bin/python main.py --smoke-test
 ```
 
-The 27-test numerical suite covers discrete Poisson, continuity for random orbits and
+The 34-test numerical suite covers discrete Poisson, continuity for random orbits and
 cell-boundary endpoints, wall and corner reflection, Boris magnetic invariance,
 electric acceleration, the Yee curls against an analytic mode with test-only
 fixed endpoints, 1,200-step
@@ -388,6 +407,12 @@ Deletion checks verify exact instantaneous field preservation for both particle
 signs and fixed/free states, local outward evolution and energy escape, continued
 magnetic-wave propagation, the modified Gauss identity, repeated deletion,
 addition during a removal wave, invalid-index handling, and reset cleanup.
+Higuera–Cary checks cover force-balanced crossed fields up to `v=0.9999c`,
+magnetic energy, exact electric/manual-force kicks, frozen-field reversibility,
+second-order convergence against an analytic magnetic orbit, a strong-field
+cancellation case, and use of the new pusher in both the active particle loop
+and initial staggering. Existing continuity and wall-bounce tests also run
+through the new pusher.
 The GUI test exercises add/delete, negative injection, key-repeat
 suppression, force dragging, double-click pin/release, proton/electron injection,
 single-charge reset, all scalar layers, themes, and resizing, then
@@ -408,3 +433,5 @@ Delete/Backspace, empty-space clicks, single-step propagation, and saves
 - `maxwell/app.py`: rendering, themes, controls, and scheduling.
 - `maxwell/macos.py`: volatile Cocoa preferences and restoration opt-out.
 - `tests/test_physics.py`: numerical regression tests.
+- `tests/test_pushers.py`: Higuera–Cary accuracy and integration checks.
+- `docs/fieldlines-review.md`: tracing methodology and near-overlap dipole analysis.

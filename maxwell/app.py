@@ -217,7 +217,7 @@ class FieldWindow(pyglet.window.Window):
         self.label('DRAG  force    DOUBLE CLICK  fix/free    SPACE  add    RIGHT CLICK  remove',
                    44, 39, 9, p['muted'])
         self.fps_label = self.label('', w-44, 62, 11, p['accent'], anchor='right')
-        self.label(f'Yee {cfg.nx} × {cfg.ny}  ·  Boris  ·  RK4', w-44, 39, 9, p['muted'], anchor='right')
+        self.label(f'Yee {cfg.nx} × {cfg.ny}  ·  H–C  ·  RK4', w-44, 39, 9, p['muted'], anchor='right')
         self.update_stats()
         self.refresh_heat()
 

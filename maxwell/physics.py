@@ -103,7 +103,7 @@ def drift_reflect(x, y, vx, vy, q, jx, jy, dx, dy, dt, width, height, radius):
 
 @njit(cache=True)
 def boris(px, py, ex, ey, bz, q_over_m, dt, c, fx=0.0, fy=0.0):
-    """Relativistic Boris rotation for proper velocity u = gamma*v.
+    """Reference relativistic Boris pusher, retained for numerical comparisons.
 
     The optional external force is acceleration (force/mass), split into
     the same two kicks as the electric field. No arbitrary speed clipping.
@@ -116,6 +116,29 @@ def boris(px, py, ex, ey, bz, q_over_m, dt, c, fx=0.0, fy=0.0):
     prime_x, prime_y = ux+uy*t, uy-ux*t
     return (ux+prime_y*s + 0.5*dt*(q_over_m*ex+fx),
             uy-prime_x*s + 0.5*dt*(q_over_m*ey+fy))
+
+
+@njit(cache=True)
+def higuera_cary(px, py, ex, ey, bz, q_over_m, dt, c, fx=0.0, fy=0.0):
+    """Higuera–Cary update of proper velocity u=gamma*v in the xy plane.
+
+    Same kick/rotation/kick as Boris, with the momentum-centered rotation
+    factor from Eq. (20) of https://arxiv.org/abs/1701.05605.
+    Since u_z=0 and B=(0,0,Bz), u_minus dot tau is identically zero.
+    External force/mass is held constant over the two kicks, as before.
+    """
+    kick_x, kick_y = .5*dt*(q_over_m*ex+fx), .5*dt*(q_over_m*ey+fy)
+    ux, uy = px+kick_x, py+kick_y
+    tau = .5*dt*q_over_m*bz
+    sigma = 1.0+(ux*ux+uy*uy)/(c*c)-tau*tau
+    root = math.hypot(sigma, 2*tau)
+    # Rationalize the positive quadratic root when sigma<0 to avoid losing
+    # all significant digits in strong B / large timestep cases.
+    gamma_sq = .5*(sigma+root) if sigma >= 0 else 2*tau*tau/(root-sigma)
+    t = tau/math.sqrt(gamma_sq)
+    s = 2*t/(1+t*t)
+    prime_x, prime_y = ux+uy*t, uy-ux*t
+    return ux+prime_y*s+kick_x, uy-prime_x*s+kick_y
 
 
 @njit(cache=True)
@@ -191,8 +214,8 @@ def push_particles(pos, momentum, charge, mass, fixed, ex, ey, bz, jx, jy,
             fy = 90*(target[1]-y)-16*momentum[p, 1]/g
             scale = min(1.0, 180.0/max(math.hypot(fx, fy), 1e-15))
             fx, fy = fx*scale, fy*scale
-        ux, uy = boris(momentum[p, 0], momentum[p, 1], electric_x,
-                       electric_y, magnetic, charge[p]/mass[p], dt, c, fx, fy)
+        ux, uy = higuera_cary(momentum[p, 0], momentum[p, 1], electric_x,
+                             electric_y, magnetic, charge[p]/mass[p], dt, c, fx, fy)
         gamma = math.sqrt(1+(ux*ux+uy*uy)/(c*c))
         x, y, sx, sy = drift_reflect(x, y, ux/gamma, uy/gamma, charge[p],
                                     jx, jy, dx, dy, dt, width, height, radius)
@@ -310,9 +333,9 @@ class Simulation:
             ex = sample(self.ex, x, y, self.dx, self.dy, .5, 0.)
             ey = sample(self.ey, x, y, self.dx, self.dy, 0., .5)
             bz = sample(self.bz, x, y, self.dx, self.dy, .5, .5)
-            self.momentum[i] = boris(*self.momentum[i], ex, ey, bz,
-                                      self.charge[i]/self.mass[i], -self.dt/2,
-                                      self.config.c)
+            self.momentum[i] = higuera_cary(*self.momentum[i], ex, ey, bz,
+                                           self.charge[i]/self.mass[i], -self.dt/2,
+                                           self.config.c)
 
     def update_rho(self):
         deposit_charge(self.pos, self.charge, self.rho, self.dx, self.dy)

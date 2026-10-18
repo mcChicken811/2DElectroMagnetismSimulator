@@ -106,3 +106,6 @@ For comparison without code changes, use stationary charges, inspect the
 a finer grid (for example `--grid 256x160`). Keep comparing numeric color
 legends: each heatmap uses its own automatic maximum. No field-line code was
 modified for this investigation.
+
+For the derivation and limitations of replacing tracing with stream-function
+contours, see [the stream-function viability study](streamfunction-viability.md).
